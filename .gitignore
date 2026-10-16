@@ -15,8 +15,8 @@ __pycache__/
 # ===== PyInstaller 打包中间产物与成品 =====
 build_pkg/
 *.spec
-# 成品 exe 建议通过 GitHub Releases 分发，不放进仓库
-快捷翻译.exe
+# 所有 exe 成品都通过 GitHub Releases 分发，不放进仓库（忽略任意文件名的 .exe）
+*.exe
 
 # ===== 临时测试与输出文件 =====
 test_*.py
