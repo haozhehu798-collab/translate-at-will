@@ -1,0 +1,11 @@
+# 快捷翻译运行/构建依赖（Windows 10/11，Python 3.11+）
+# 安装：pip install -r requirements.txt
+# 注：tkinter 为 Windows 官方 Python 自带，无需安装；winocr 会自动带齐所需的 winrt 运行时。
+
+keyboard
+requests
+pillow
+mss
+pystray
+pywin32
+winocr

@@ -1,0 +1,24 @@
+# ===== 敏感与个人数据（切勿提交） =====
+# config.ini 含明文 API Key / 密钥；history.csv 为个人查词历史；cache/ 为运行缓存
+config.ini
+history.csv
+cache/
+
+# ===== Python 运行/构建环境 =====
+.build_env/
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== PyInstaller 打包中间产物与成品 =====
+build_pkg/
+*.spec
+# 成品 exe 建议通过 GitHub Releases 分发，不放进仓库
+快捷翻译.exe
+
+# ===== 临时测试与输出文件 =====
+test_*.py
+*.tmp
+*.log
