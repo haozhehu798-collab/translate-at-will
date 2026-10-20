@@ -629,11 +629,12 @@ def _count_lines(text):
     return len([l for l in text.replace("\r\n", "\n").split("\n") if l.strip()])
 
 
-def translate_block(text, cfg):
+def translate_block(text, cfg, on_progress=None):
     """多行文本逐行翻译，保持行序一一对应。
 
     返回 (pairs, engine)；pairs 为 [(原文行, 译文行), ...]，
     原文中的空行保留为 ("", "")，用于还原段落间隔。
+    on_progress(done, total) 为可选的进度回调（逐行完成时调用）。
     """
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     idx = [i for i, l in enumerate(lines) if l.strip()]
@@ -664,16 +665,38 @@ def translate_block(text, cfg):
             return i, ""
 
     if missing:
+        total = len(missing)
+        done = [0]
+        lock = threading.Lock()
+
+        def report():
+            if on_progress:
+                try:
+                    on_progress(done[0], total)
+                except Exception:
+                    pass
+
         if use_baidu:
             # 百度标准版 QPS=1，串行并轻微限速
             for i in missing:
                 _i, d = work(i)
                 results[_i] = d
+                with lock:
+                    done[0] += 1
+                report()
                 time.sleep(0.2)
         else:
+            # 免费接口并发提速，最多 6 路
+            def work2(i):
+                r = work(i)
+                with lock:
+                    done[0] += 1
+                report()
+                return r
+
             with ThreadPoolExecutor(
-                    max_workers=min(4, len(missing))) as ex:
-                for i, d in ex.map(work, missing):
+                    max_workers=min(6, total)) as ex:
+                for i, d in ex.map(work2, missing):
                     results[i] = d
 
     pairs = []
@@ -796,105 +819,247 @@ def ocr_recognize(img, lang_pref="en"):
     return text, fallback_tag
 
 
+def _enlarge_for_ocr(img):
+    """对截图选区等比放大，显著提升“图片内小字 / 彩色 / 压缩字”的识别率。"""
+    try:
+        img = img.convert("RGB")
+        w, h = img.size
+        longest = max(w, h)
+        if longest < 1000:
+            factor = 2.0
+        elif longest < 1600:
+            factor = 1.5
+        else:
+            factor = 1.0
+        if factor > 1.0:
+            img = img.resize(
+                (max(1, int(w * factor)), max(1, int(h * factor))),
+                Image.LANCZOS)
+        return img
+    except Exception:
+        return img
+
+
 # ---------------------------------------------------------------- RegionSelector
 
 class RegionSelector(tk.Toplevel):
-    """全屏冻结快照 + 鼠标拖拽框选（同微信截图，可保留弹出菜单）。"""
+    """全屏冻结快照 + 鼠标拖拽框选（同微信截图，可保留弹出菜单）。
+
+    防卡死设计：
+      - 压暗层为固定全屏点阵（拖拽时不重绘），框内“清晰区”只贴一块与背景同源
+        的小裁剪图，并节流到约 55 帧/秒更新，拖拽跟手、不阻塞主线程；
+      - Esc / 右键取消，且通过全局键盘钩子兜底（焦点不在遮罩上也能取消）；
+      - 30 秒未操作自动取消；任何异常都保证遮罩被销毁，绝不留下全屏黑窗；
+      - 框选坐标按 canvas 与截图的实际尺寸比例换算，高 DPI 下也不会错位。
+    """
+
+    CANCEL_AFTER_MS = 30000
 
     def __init__(self, master, vleft, vtop, vw, vh, on_done, background=None):
         super().__init__(master)
         self.on_done = on_done
         self.bg_img = background
         self.vleft, self.vtop = vleft, vtop
+        self.vw, self.vh = vw, vh
         self.sx = self.sy = None
         self.rect = None
         self.size_lbl = None
         self.tip_lbl = None
-        self.clear_img = None
-        self.clear_photo = None
+        self._finished = False
+        self._esc_hook = None
+        self._timeout_id = None
 
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.configure(bg="black")
         self.geometry("%dx%d+%d+%d" % (vw, vh, vleft, vtop))
         self.canvas = tk.Canvas(self, bg="black", highlightthickness=0,
-                                width=vw, height=vh, cursor="crosshair")
+                                width=vw, height=vh, cursor="crosshair",
+                                bd=0, takefocus=1)
         self.canvas.pack(fill="both", expand=True)
 
+        # 背景冻结快照（一次性生成；失败则退化为纯黑遮罩，仍可框选）
+        self.photo = None
         if background is not None:
-            self.photo = ImageTk.PhotoImage(background)
-            self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
-            # 整体轻微压暗；框选后框内恢复清晰
-            self.dim = self.canvas.create_rectangle(
-                0, 0, vw, vh, fill="black", stipple="gray25", outline="")
-        else:
-            self.photo = None
-            self.dim = None
+            try:
+                self.photo = ImageTk.PhotoImage(background)
+                self.canvas.create_image(0, 0, anchor="nw", image=self.photo)
+            except Exception:
+                self.photo = None
 
+        # 压暗层：一块固定全屏的半透明点阵。创建后坐标永不再变，因此框选拖拽时
+        # 这一层完全不参与重绘——逐帧重绘大面积 stipple 正是之前卡顿的主要原因。
+        self.m_dim = self.canvas.create_rectangle(
+            0, 0, vw, vh, fill="black", stipple="gray25", outline="")
+
+        # 框内清晰快照：拖拽时把背景图“框选区域”的裁剪图贴到这一层（盖在压暗层
+        # 之上），形成“框外压暗、框内清晰”的效果。该层只在节流回调里更新，且是
+        # 小图上传，不会像整屏重绘那样掉帧。
+        self._hole_photo = None
+        self._hole_pending = False
+        self._last_box = None
+        self.hole_img = self.canvas.create_image(0, 0, anchor="nw")
+
+        self.rect = self.canvas.create_rectangle(
+            0, 0, 0, 0, outline="#3B82F6", width=2)
+        self.size_lbl = self.canvas.create_text(
+            8, 8, anchor="sw", text="", fill="white",
+            font=(FONT_FAMILY, 9))
         self.tip_lbl = self.canvas.create_text(
-            vw // 2, 46, text="拖动鼠标框选要翻译的区域，按 Esc 取消",
+            vw // 2, 46,
+            text="拖动鼠标框选要翻译的区域        Esc / 右键 取消",
             fill="white", font=(FONT_FAMILY, 12, "bold"))
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)
         self.canvas.bind("<B1-Motion>", self.on_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_release)
-        self.bind("<Escape>", self.on_cancel)
         self.canvas.bind("<ButtonPress-3>", self.on_cancel)
-        self.focus_force()
+        self.canvas.bind("<Escape>", self.on_cancel)
+        self.bind("<Escape>", self.on_cancel)
 
-    def on_press(self, e):
-        self.sx, self.sy = e.x, e.y
-        if self.tip_lbl is not None:
-            self.canvas.delete(self.tip_lbl)
-            self.tip_lbl = None
-        self.rect = self.canvas.create_rectangle(
-            e.x, e.y, e.x, e.y, outline="#3B82F6", width=2)
-        self.size_lbl = self.canvas.create_text(
-            e.x + 8, e.y - 10, anchor="sw", text="0 × 0",
-            fill="white", font=(FONT_FAMILY, 9))
+        self.after(60, self._arm)
+        self._timeout_id = self.after(self.CANCEL_AFTER_MS, self.on_cancel)
+        # 全局 Esc 兜底：即使焦点不在遮罩上，也能强制取消（不拦截按键）
+        try:
+            self._esc_hook = keyboard.add_hotkey(
+                "esc", lambda: self.after(0, self.on_cancel), suppress=False)
+        except Exception:
+            self._esc_hook = None
 
-    def _update_clear(self, x1, y1, x2, y2):
-        """框内显示清晰快照（覆盖压暗层）。"""
-        if self.clear_img is not None:
-            self.canvas.delete(self.clear_img)
-            self.clear_img = None
-        if self.bg_img is None or x2 <= x1 or y2 <= y1:
+    def _arm(self):
+        if self._finished:
             return
         try:
-            crop = self.bg_img.crop((x1, y1, x2, y2))
-            self.clear_photo = ImageTk.PhotoImage(crop)
-            self.clear_img = self.canvas.create_image(
-                x1, y1, anchor="nw", image=self.clear_photo)
-            self.canvas.tag_raise(self.rect)
-            self.canvas.tag_raise(self.size_lbl)
+            self.focus_force()
+            self.canvas.focus_set()
         except Exception:
             pass
 
-    def on_drag(self, e):
-        if self.rect is None:
+    def on_press(self, e):
+        self.sx, self.sy = e.x, e.y
+        self._last_box = None
+        if self.tip_lbl is not None:
+            self.canvas.delete(self.tip_lbl)
+            self.tip_lbl = None
+        self.canvas.coords(self.rect, e.x, e.y, e.x, e.y)
+        self.canvas.coords(self.size_lbl, e.x + 8, e.y - 10)
+        self._set_hole(e.x, e.y, e.x, e.y)
+
+    def _clamp_box(self, x1, y1, x2, y2):
+        x1 = max(0, min(self.vw, x1))
+        x2 = max(0, min(self.vw, x2))
+        y1 = max(0, min(self.vh, y1))
+        y2 = max(0, min(self.vh, y2))
+        if x1 > x2:
+            x1, x2 = x2, x1
+        if y1 > y2:
+            y1, y2 = y2, y1
+        return int(x1), int(y1), int(x2), int(y2)
+
+    def _set_hole(self, x1, y1, x2, y2):
+        """把背景图的框选区域作为清晰小图贴到压暗层之上，形成“挖洞”效果。"""
+        if x2 - x1 < 2 or y2 - y1 < 2 or self.bg_img is None:
+            self._hole_photo = None
+            try:
+                self.canvas.itemconfig(self.hole_img, image="")
+            except Exception:
+                pass
             return
-        x1, y1 = min(self.sx, e.x), min(self.sy, e.y)
-        x2, y2 = max(self.sx, e.x), max(self.sy, e.y)
+        try:
+            # 背景全屏图与 canvas 同尺寸（同源 mss 截图），裁剪坐标可直接对应
+            crop = self.bg_img.crop((x1, y1, x2, y2))
+            self._hole_photo = ImageTk.PhotoImage(crop)
+            self.canvas.itemconfig(self.hole_img, image=self._hole_photo)
+            self.canvas.coords(self.hole_img, x1, y1)
+        except Exception:
+            self._hole_photo = None
+
+    def _flush_hole(self):
+        self._hole_pending = False
+        if self._finished or self._last_box is None:
+            return
+        self._set_hole(*self._last_box)
+
+    def on_drag(self, e):
+        if self.sx is None:
+            return
+        x1, y1, x2, y2 = self._clamp_box(
+            min(self.sx, e.x), min(self.sy, e.y),
+            max(self.sx, e.x), max(self.sy, e.y))
+        # 边框与尺寸标签是轻量矢量图元，立即更新，保证跟手
         self.canvas.coords(self.rect, x1, y1, x2, y2)
-        self._update_clear(x1, y1, x2, y2)
         self.canvas.coords(self.size_lbl, x2 + 8, y1 - 10)
         self.canvas.itemconfigure(self.size_lbl,
                                   text="%d × %d" % (x2 - x1, y2 - y1))
+        # 清晰小图（像素上传）相对重，节流到约 55 帧/秒，避免逐帧重建造成卡顿
+        self._last_box = (x1, y1, x2, y2)
+        if not self._hole_pending:
+            self._hole_pending = True
+            self.after(18, self._flush_hole)
 
     def on_release(self, e):
-        if self.sx is None or abs(e.x - self.sx) < 5 or abs(e.y - self.sy) < 5:
+        if self.sx is None:
             self.on_cancel()
             return
         x1, y1 = min(self.sx, e.x), min(self.sy, e.y)
         x2, y2 = max(self.sx, e.x), max(self.sy, e.y)
-        bbox = (x1 + self.vleft, y1 + self.vtop,
-                x2 + self.vleft, y2 + self.vtop)
-        self.destroy()
-        self.on_done(bbox)
+        if x2 - x1 < 5 or y2 - y1 < 5:
+            self.on_cancel()
+            return
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(self.vw, x2), min(self.vh, y2)
+        bbox = self._to_physical(x1, y1, x2, y2)
+        self._safe_finish(bbox)
+
+    def _to_physical(self, x1, y1, x2, y2):
+        """canvas 显示坐标 -> 背景截图像素坐标（按实际尺寸比例换算，DPI 无关）。"""
+        try:
+            cw = self.canvas.winfo_width() or self.vw
+            ch = self.canvas.winfo_height() or self.vh
+            if self.bg_img is not None:
+                iw, ih = self.bg_img.size
+                sx, sy = iw / cw, ih / ch
+            else:
+                sx = sy = 1.0
+        except Exception:
+            sx = sy = 1.0
+        return (int(round(x1 * sx)) + self.vleft,
+                int(round(y1 * sy)) + self.vtop,
+                int(round(x2 * sx)) + self.vleft,
+                int(round(y2 * sy)) + self.vtop)
 
     def on_cancel(self, *_):
-        self.destroy()
-        self.on_done(None)
+        self._safe_finish(None)
+
+    def _safe_finish(self, bbox):
+        """无论正常、异常、超时、取消，都保证遮罩只销毁一次、回调只执行一次。"""
+        if self._finished:
+            return
+        self._finished = True
+        if self._timeout_id is not None:
+            try:
+                self.after_cancel(self._timeout_id)
+            except Exception:
+                pass
+            self._timeout_id = None
+        if self._esc_hook is not None:
+            try:
+                keyboard.remove_hotkey(self._esc_hook)
+            except Exception:
+                pass
+            self._esc_hook = None
+        try:
+            self.withdraw()
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+        try:
+            self.on_done(bbox)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- 样式
@@ -1362,6 +1527,57 @@ class TipWindow(tk.Toplevel):
         self.focus_force()
         if autoclose:
             self.after(int(autoclose * 1000), self.destroy)
+
+
+class LoadingWindow(tk.Toplevel):
+    """工作中提示（不自动关闭）：OCR / 翻译期间让用户明确知道程序正在处理。"""
+
+    def __init__(self, master, text):
+        super().__init__(master)
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(bg=C["line"])
+        box = tk.Frame(self, bg=C["bg"])
+        box.pack(fill="both", expand=True, padx=1, pady=1)
+        row = tk.Frame(box, bg=C["bg"])
+        row.pack(padx=18, pady=12)
+        self.dot = tk.Label(row, text="●", bg=C["bg"], fg=C["accent"],
+                            font=("Segoe UI Symbol", 13))
+        self.dot.pack(side="left", padx=(0, 10))
+        self.var = tk.StringVar(value=text)
+        tk.Label(row, textvariable=self.var, bg=C["bg"], fg=C["dst"],
+                 justify="left", font=(FONT_FAMILY, 10)).pack(side="left")
+        self._n = 0
+        self._tick()
+        self.after(40, self._place)
+
+    def set_text(self, text):
+        self.var.set(text)
+
+    def _tick(self):
+        if not self.winfo_exists():
+            return
+        self._n = (self._n + 1) % 4
+        self.dot.configure(text="●" if self._n in (0, 1) else "○")
+        self.after(380, self._tick)
+
+    def _place(self):
+        try:
+            cx, cy = win32api.GetCursorPos()
+            self.update_idletasks()
+            w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+            wa = workarea_at(cx, cy)
+            x = min(max(cx - w // 2, wa.left + 8), wa.right - w - 8)
+            y = min(max(cy + 22, wa.top + 8), wa.bottom - h - 8)
+            self.geometry("%dx%d+%d+%d" % (w, h, x, y))
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- 设置窗
@@ -2000,6 +2216,8 @@ class App:
         elif kind == "tip":
             self.busy = False
             self.show_tip(msg[1])
+        elif kind == "loading":
+            self.show_loading(msg[1])
         elif kind == "ocr_region":
             self.on_ocr_region(msg[1])
         elif kind == "ocr_shot":
@@ -2064,6 +2282,7 @@ class App:
             if not text:
                 self.q.put(("tip", "未获取到选中的文字\n请先选中内容，再按快捷键"))
                 return
+            self.q.put(("loading", "正在翻译…"))
             self.translate_and_show(text)
         except Exception as e:
             self.q.put(("tip", "出错了：%s" % e))
@@ -2072,7 +2291,12 @@ class App:
         try:
             if _count_lines(text) >= 2:
                 # 多行：逐行翻译并保持行序一一对应
-                pairs, engine = translate_block(text, self.cfg)
+                def _prog(done, total):
+                    self.q.put(("loading",
+                               "正在翻译… %d/%d 行" % (done, total)))
+
+                pairs, engine = translate_block(
+                    text, self.cfg, on_progress=_prog)
                 dst = "\n".join(d for _s, d in pairs if d)
                 data = {"src": text, "mode": "sentence", "dst": dst,
                         "pairs": pairs, "engine": engine,
@@ -2107,11 +2331,7 @@ class App:
         try:
             self.busy = True
             self._shot, self._mon = img, mon
-            vleft, vtop, vw, vh = virtual_screen()
-            RegionSelector(
-                self.root, vleft, vtop, vw, vh,
-                on_done=lambda bbox: self.q.put(("ocr_region", bbox)),
-                background=img)
+            self._open_selector(img, mon)
         except Exception as e:
             self.busy = False
             self.show_tip("截图初始化失败：%s" % e)
@@ -2120,32 +2340,48 @@ class App:
         try:
             img, mon = capture_virtual()
             self._shot, self._mon = img, mon
-            vleft, vtop, vw, vh = virtual_screen()
-            RegionSelector(
-                self.root, vleft, vtop, vw, vh,
-                on_done=lambda bbox: self.q.put(("ocr_region", bbox)))
+            self._open_selector(img, mon)
         except Exception as e:
             self.busy = False
             self.show_tip("截图初始化失败：%s" % e)
+
+    def _open_selector(self, img, mon):
+        # 遮罩几何与截图、裁剪坐标完全同源（mon 即 mss 虚拟屏），避免坐标错位
+        RegionSelector(
+            self.root, mon["left"], mon["top"], mon["width"], mon["height"],
+            on_done=lambda bbox: self.q.put(("ocr_region", bbox)),
+            background=img)
 
     def on_ocr_region(self, bbox):
         if not bbox:
             self.busy = False
             return
+        # 框选完成立刻给出反馈，遮罩关闭后马上进入“工作中”状态
+        self.show_loading("正在识别画面文字…")
         self.pool.submit(self.flow_ocr, bbox)
 
     def flow_ocr(self, bbox):
         try:
             mon = self._mon
+            shot = self._shot
+            W, H = shot.size
             left, top, right, bottom = bbox
-            box = (left - mon["left"], top - mon["top"],
-                   right - mon["left"], bottom - mon["top"])
-            crop = self._shot.crop(box)
+            pad = 10  # 选区四周向外扩，避免切掉字边缘
+            box = (max(0, left - mon["left"] - pad),
+                   max(0, top - mon["top"] - pad),
+                   min(W, right - mon["left"] + pad),
+                   min(H, bottom - mon["top"] + pad))
+            crop = _enlarge_for_ocr(shot.crop(box))
             text, fb = ocr_recognize(crop, self.cfg.ocr_lang)
             text = clean_text(text)
             if not text:
-                self.q.put(("tip", "未识别到文字，请重新框选"))
+                self.q.put(("tip", "未识别到文字，请重新框选（可把框选范围放大一些）"))
                 return
+            n = _count_lines(text)
+            if n >= 2:
+                self.q.put(("loading", "正在翻译…（共 %d 行）" % n))
+            else:
+                self.q.put(("loading", "正在翻译…"))
             self.translate_and_show(text, ocr_fallback=bool(fb))
         except OcrLangError as e:
             self.q.put(("tip", str(e)))
@@ -2239,6 +2475,22 @@ class App:
             except Exception:
                 pass
         self.cur_window = TipWindow(self.root, text)
+
+    def show_loading(self, text):
+        cur = self.cur_window
+        if isinstance(cur, LoadingWindow):
+            try:
+                if cur.winfo_exists():
+                    cur.set_text(text)
+                    return
+            except Exception:
+                pass
+        elif cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+        self.cur_window = LoadingWindow(self.root, text)
 
     # ---- 托盘动作
     def on_tray(self, name):
